@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDEs
+.vscode/
+.idea/
+*.suo
+*.user
+
+# Large video files (optional — remove these lines if you want videos tracked)
+*.mp4
+*.avi
+*.mov
+
+# Generated outputs (reproduced by running scripts)
+Output_Videos/
+
+# Large model weights
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# Compiled Arduino
+*.elf
+*.hex
+*.bin
+build/
+
+# Radar pycache
+Radar_Base_Configurations/utility/__pycache__/
