@@ -1,19 +1,15 @@
 """
 motor_controller.py  —  Jetson Orin Nano
-Autonomous control via Serial (GPIO pin 8, fast)
+Autonomous control via WiFi UDP to Arduino (172.20.10.3:5005)
 Pause/resume via UDP port 5006 from laptop
 """
 
 import socket
-import serial
 import threading
 import time
 
-# ── Serial (Jetson GPIO → Arduino) ───────────────────────────
-SERIAL_PORT  = '/dev/ttyTHS1'
-SERIAL_BAUD  = 9600
-
-# ── WiFi UDP pause/resume listener ───────────────────────────
+ARDUINO_IP   = "172.20.10.3"
+ARDUINO_PORT = 5005
 PAUSE_PORT   = 5006
 
 CMD_FORWARD  = b'f'
@@ -24,13 +20,11 @@ CMD_LEFT     = b'a'
 CMD_RIGHT    = b'd'
 CMD_CENTRE   = b'c'
 
-# ── Distance thresholds ───────────────────────────────────────
 SIDE_STEER_M    = 10.0
 CAUTION_M       = 7.0
 STOP_M          = 5.0
 BYPASS_OPEN_M   = 3.0
 
-# ── Manoeuvre timings ─────────────────────────────────────────
 STOP_TIME_S     = 0.5
 REVERSE_TIME_S  = 2.0
 TURN_TIME_S     = 0.8
@@ -50,10 +44,7 @@ class MotorController:
     STRAIGHTENING = "STRAIGHTENING"
 
     def __init__(self):
-        # Serial connection to Arduino
-        self._ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=0)
-        time.sleep(2)
-
+        self._sock          = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._paused        = False
         self._last_throttle = None
         self._last_steer    = None
@@ -72,8 +63,7 @@ class MotorController:
         self._running = True
         threading.Thread(target=self._loop,         daemon=True).start()
         threading.Thread(target=self._listen_pause, daemon=True).start()
-        print(f"[MOTOR] Serial ready on {SERIAL_PORT} @ {SERIAL_BAUD}")
-        print(f"[MOTOR] Pause listener on UDP port {PAUSE_PORT}")
+        print(f"[MOTOR] Ready -> {ARDUINO_IP}:{ARDUINO_PORT} @ {LOOP_HZ}Hz")
 
     def _listen_pause(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -107,9 +97,9 @@ class MotorController:
 
     def _send(self, cmd: bytes):
         try:
-            self._ser.write(cmd)
+            self._sock.sendto(cmd, (ARDUINO_IP, ARDUINO_PORT))
         except Exception as e:
-            print(f"[MOTOR] Serial error: {e}")
+            print(f"[MOTOR] UDP error: {e}")
 
     def _send_throttle(self, cmd: bytes):
         if cmd != self._last_throttle:
@@ -238,5 +228,4 @@ class MotorController:
         self._running = False
         self._send(CMD_STOP)
         self._send(CMD_CENTRE)
-        self._ser.close()
         print("[MOTOR] Stopped")

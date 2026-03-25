@@ -1,32 +1,16 @@
-/*
-  RC Car Motor Controller — Arduino Uno R4 WiFi
-  ESC      -> pin 9
-  Servo    -> pin 10
-  Jetson   -> pin 2 (SoftwareSerial RX, GPIO serial)
-  Laptop   -> WiFi UDP port 5005
-
-  Jetson autonomous = serial on pin 2 (fast, low latency)
-  Laptop manual     = WiFi UDP (wireless override)
-*/
-
 #include <Servo.h>
-#include <SoftwareSerial.h>
 #include <WiFiS3.h>
 #include <WiFiUdp.h>
 
 Servo esc;
 Servo steering;
 
-// Jetson serial on pin 2
-SoftwareSerial jetson(2, 3);  // RX=2, TX=3 (TX unused)
-
-// WiFi for laptop control
 const char* ssid     = "Raffay";
 const char* password = "22997788";
 const int   UDP_PORT = 5005;
+
 WiFiUDP udp;
 
-// Reverse state machine
 enum ReverseState { IDLE, BRAKE, NEUTRAL_WAIT, REVERSING };
 ReverseState revState  = IDLE;
 unsigned long revTimer = 0;
@@ -65,18 +49,13 @@ void handleCmd(char cmd) {
 
 void setup() {
   Serial.begin(9600);
-  jetson.begin(9600);
-
   esc.attach(9, 1000, 2000);
   steering.attach(10, 1000, 2000);
   esc.writeMicroseconds(1500);
   steering.writeMicroseconds(1500);
   Serial.println("Holding neutral - plug in battery NOW");
   delay(5000);
-  Serial.println("ESC armed");
 
-  // Connect WiFi
-  Serial.print("Connecting to "); Serial.println(ssid);
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
     delay(500); Serial.print(".");
@@ -88,19 +67,11 @@ void setup() {
   Serial.print(ip[2]); Serial.print(".");
   Serial.println(ip[3]);
   udp.begin(UDP_PORT);
-  Serial.println("Ready - Serial(pin2) + WiFi UDP(5005)");
+  Serial.println("Ready");
 }
 
 void loop() {
   updateReverse();
-
-  // Jetson serial (autonomous - fast)
-  if (jetson.available()) {
-    char cmd = jetson.read();
-    handleCmd(cmd);
-  }
-
-  // Laptop WiFi UDP (manual override)
   int packetSize = udp.parsePacket();
   if (packetSize) {
     char cmd = udp.read();
