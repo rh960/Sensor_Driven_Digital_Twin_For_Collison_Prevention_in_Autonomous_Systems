@@ -1,9 +1,3 @@
-"""
-motor_controller.py  —  Jetson Orin Nano
-Autonomous control via WiFi UDP to Arduino (172.20.10.3:5005)
-Pause/resume via UDP port 5006 from laptop
-"""
-
 import socket
 import threading
 import time
@@ -20,18 +14,16 @@ CMD_LEFT     = b'a'
 CMD_RIGHT    = b'd'
 CMD_CENTRE   = b'c'
 
-SIDE_STEER_M    = 10.0
-CAUTION_M       = 7.0
-STOP_M          = 5.0
-BYPASS_OPEN_M   = 3.0
-
+SIDE_STEER_M    = 2.0
+CAUTION_M       = 2.0
+STOP_M          = 1.0
+BYPASS_OPEN_M   = 1.0
 STOP_TIME_S     = 0.5
 REVERSE_TIME_S  = 2.0
 TURN_TIME_S     = 0.8
 ESCAPE_TIME_S   = 1.5
 STRAIGHT_TIME_S = 0.8
-
-LOOP_HZ = 20
+LOOP_HZ         = 20
 
 
 class MotorController:
@@ -49,21 +41,18 @@ class MotorController:
         self._last_throttle = None
         self._last_steer    = None
         self._log_timer     = 0.0
-
         self._state         = self.NORMAL
         self._state_until   = 0.0
         self._escape_dir    = CMD_RIGHT
-
-        self._lock  = threading.Lock()
-        self._level = "SAFE"
-        self._fl    = None
-        self._fc    = None
-        self._fr    = None
-
-        self._running = True
+        self._lock          = threading.Lock()
+        self._level         = "SAFE"
+        self._fl            = None
+        self._fc            = None
+        self._fr            = None
+        self._running       = True
         threading.Thread(target=self._loop,         daemon=True).start()
         threading.Thread(target=self._listen_pause, daemon=True).start()
-        print(f"[MOTOR] Ready -> {ARDUINO_IP}:{ARDUINO_PORT} @ {LOOP_HZ}Hz")
+        print(f"[MOTOR] Ready -> {ARDUINO_IP}:{ARDUINO_PORT} @ {LOOP_HZ}Hz UDP")
 
     def _listen_pause(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -102,19 +91,19 @@ class MotorController:
             print(f"[MOTOR] UDP error: {e}")
 
     def _send_throttle(self, cmd: bytes):
-        if cmd != self._last_throttle:
-            self._send(cmd)
-            self._last_throttle = cmd
+        self._send(cmd)
+        self._last_throttle = cmd
 
     def _send_steer(self, cmd: bytes):
-        if cmd != self._last_steer:
-            self._send(cmd)
-            self._last_steer = cmd
+        self._send(cmd)
+        self._last_steer = cmd
 
     def update(self, level: str, fl, fc, fr):
         with self._lock:
             self._level = level
-            self._fl = fl; self._fc = fc; self._fr = fr
+            self._fl    = fl
+            self._fc    = fc
+            self._fr    = fr
 
     def _loop(self):
         interval = 1.0 / LOOP_HZ
@@ -123,16 +112,17 @@ class MotorController:
             if not self._paused:
                 with self._lock:
                     level = self._level
-                    fl = self._fl; fc = self._fc; fr = self._fr
+                    fl    = self._fl
+                    fc    = self._fc
+                    fr    = self._fr
                 self._process(level, fl, fc, fr)
             elapsed = time.time() - t0
-            sleep = interval - elapsed
+            sleep   = interval - elapsed
             if sleep > 0:
                 time.sleep(sleep)
 
     def _process(self, level, fl, fc, fr):
         now = time.time()
-
         l = fl if fl is not None else 9.0
         c = fc if fc is not None else 9.0
         r = fr if fr is not None else 9.0
@@ -147,7 +137,7 @@ class MotorController:
             if now >= self._state_until:
                 self._escape_dir = CMD_RIGHT if l >= r else CMD_LEFT
                 print(f"[MOTOR] -> REVERSING (escape={'RIGHT' if self._escape_dir==CMD_RIGHT else 'LEFT'})")
-                self._state = self.REVERSING
+                self._state       = self.REVERSING
                 self._state_until = now + REVERSE_TIME_S
             return
 
@@ -156,7 +146,7 @@ class MotorController:
             self._send_steer(CMD_CENTRE)
             if now >= self._state_until:
                 print("[MOTOR] -> TURNING")
-                self._state = self.TURNING
+                self._state       = self.TURNING
                 self._state_until = now + TURN_TIME_S
             return
 
@@ -165,22 +155,22 @@ class MotorController:
             self._send_steer(self._escape_dir)
             if now >= self._state_until:
                 print("[MOTOR] -> ESCAPING")
-                self._state = self.ESCAPING
+                self._state       = self.ESCAPING
                 self._state_until = now + ESCAPE_TIME_S
             return
 
         if self._state == self.ESCAPING:
             if c <= STOP_M:
                 print(f"[MOTOR] New obstacle C={c:.1f}m - re-plan")
-                self._escape_dir = CMD_RIGHT if l >= r else CMD_LEFT
-                self._state = self.STOPPING
+                self._escape_dir  = CMD_RIGHT if l >= r else CMD_LEFT
+                self._state       = self.STOPPING
                 self._state_until = now + STOP_TIME_S
                 return
             self._send_throttle(CMD_SLOW)
             self._send_steer(self._escape_dir)
             if now >= self._state_until:
                 print("[MOTOR] -> STRAIGHTENING")
-                self._state = self.STRAIGHTENING
+                self._state       = self.STRAIGHTENING
                 self._state_until = now + STRAIGHT_TIME_S
             return
 
@@ -211,15 +201,13 @@ class MotorController:
                 self._send_steer(bypass)
             else:
                 print(f"[MOTOR] Blocked C={c:.1f}m -> STOPPING")
-                self._state = self.STOPPING
+                self._state       = self.STOPPING
                 self._state_until = now + STOP_TIME_S
                 self._send_throttle(CMD_STOP)
                 self._send_steer(CMD_CENTRE)
-
         elif c <= CAUTION_M:
             self._send_throttle(CMD_SLOW)
             self._send_steer(side_steer)
-
         else:
             self._send_throttle(CMD_FORWARD)
             self._send_steer(side_steer)

@@ -8,7 +8,6 @@ Servo steering;
 const char* ssid     = "Raffay";
 const char* password = "22997788";
 const int   UDP_PORT = 5005;
-
 WiFiUDP udp;
 
 enum ReverseState { IDLE, BRAKE, NEUTRAL_WAIT, REVERSING };
@@ -16,8 +15,7 @@ ReverseState revState  = IDLE;
 unsigned long revTimer = 0;
 
 void startReverse() {
-  revState = BRAKE;
-  revTimer = millis();
+  revState = BRAKE; revTimer = millis();
   esc.writeMicroseconds(1300);
 }
 
@@ -25,25 +23,22 @@ void updateReverse() {
   if (revState == IDLE) return;
   unsigned long now = millis();
   if (revState == BRAKE && now - revTimer > 200) {
-    esc.writeMicroseconds(1500);
-    revState = NEUTRAL_WAIT;
-    revTimer = now;
+    esc.writeMicroseconds(1500); revState = NEUTRAL_WAIT; revTimer = now;
   }
   else if (revState == NEUTRAL_WAIT && now - revTimer > 100) {
-    esc.writeMicroseconds(1300);
-    revState = REVERSING;
+    esc.writeMicroseconds(1300); revState = REVERSING;
   }
 }
 
 void handleCmd(char cmd) {
   switch (cmd) {
-    case 'f': revState = IDLE; esc.writeMicroseconds(1750);      break;
-    case 'm': revState = IDLE; esc.writeMicroseconds(1580);      break;
-    case 'r': startReverse();                                     break;
-    case 's': revState = IDLE; esc.writeMicroseconds(1500);      break;
-    case 'a': steering.writeMicroseconds(1200);                  break;
-    case 'd': steering.writeMicroseconds(1800);                  break;
-    case 'c': steering.writeMicroseconds(1500);                  break;
+    case 'f': revState=IDLE; esc.writeMicroseconds(1750); Serial.println("FWD");   break;
+    case 'm': revState=IDLE; esc.writeMicroseconds(1580); Serial.println("SLOW");  break;
+    case 'r': startReverse();                             Serial.println("REV");   break;
+    case 's': revState=IDLE; esc.writeMicroseconds(1500); Serial.println("STOP");  break;
+    case 'a': steering.writeMicroseconds(1200);           Serial.println("LEFT");  break;
+    case 'd': steering.writeMicroseconds(1800);           Serial.println("RIGHT"); break;
+    case 'c': steering.writeMicroseconds(1500);           Serial.println("CTR");   break;
   }
 }
 
@@ -55,7 +50,6 @@ void setup() {
   steering.writeMicroseconds(1500);
   Serial.println("Holding neutral - plug in battery NOW");
   delay(5000);
-
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
     delay(500); Serial.print(".");
