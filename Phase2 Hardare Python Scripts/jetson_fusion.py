@@ -650,22 +650,23 @@ class CameraDetector(threading.Thread):
     def _open_camera(self):
         import cv2
         # Try multiple pipelines in order
+        # Arducam B0262 IMX477 Mini — 2-lane MIPI, 3.9mm M12 lens, 80 deg FOV
         pipelines = [
-            # Pipeline 1: nvarguscamerasrc with jpegenc workaround for NvBuf issue
+            # Pipeline 1: native 640x480 — widest FOV, least zoom
             ("nvarguscamerasrc sensor-id=0 ! "
-             "video/x-raw(memory:NVMM), width=1920, height=1080, framerate=30/1 ! "
-             "nvvidconv ! nvvidconv ! "
+             "video/x-raw(memory:NVMM), width=640, height=480, framerate=60/1 ! "
+             "nvvidconv ! "
              "video/x-raw, width=640, height=480, format=BGRx ! "
              "videoconvert ! video/x-raw, format=BGR ! "
              "queue leaky=downstream max-size-buffers=1 ! "
              "appsink drop=1 max-buffers=1 sync=false"),
-            # Pipeline 2: lower res
+            # Pipeline 2: 1280x720 downscaled
             ("nvarguscamerasrc sensor-id=0 ! "
              "video/x-raw(memory:NVMM), width=1280, height=720, framerate=30/1 ! "
              "nvvidconv ! video/x-raw, width=640, height=480, format=BGRx ! "
              "videoconvert ! video/x-raw, format=BGR ! "
              "appsink drop=1 max-buffers=1 sync=false"),
-            # Pipeline 3: no size constraint, let nvargus choose
+            # Pipeline 3: let nvargus pick
             ("nvarguscamerasrc sensor-id=0 ! "
              "video/x-raw(memory:NVMM) ! "
              "nvvidconv ! video/x-raw, width=640, height=480, format=BGRx ! "
@@ -929,13 +930,21 @@ class FusionGUI:
         self._radar_trails: dict = {}
         self._radar_labels: dict = {}
 
-        # ── Motor controller ──────────────────────────────────────
+        # Motor controller
         try:
             from motor_controller import MotorController
             self.motor = MotorController()
         except Exception as e:
             print(f"[MOTOR] Not loaded: {e}")
             self.motor = None
+
+        # Data logger
+        try:
+            from data_logger import DataLogger
+            self.logger = DataLogger()
+        except Exception as e:
+            print(f"[LOGGER] Not loaded: {e}")
+            self.logger = None
 
         pg.setConfigOption("background", BG)
         pg.setConfigOption("foreground", GRN)
@@ -1028,7 +1037,7 @@ class FusionGUI:
         cam_vbox.addWidget(cam_title)
         self.cam_label = QtWidgets.QLabel()
         self.cam_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.cam_label.setMinimumSize(320, 240)
+        self.cam_label.setMinimumSize(640, 480)
         self.cam_label.setStyleSheet(f"background:#000;border:1px solid {DIMGRN};")
         cam_vbox.addWidget(self.cam_label, stretch=1)
         self.cam_det_lbl = QtWidgets.QLabel("No detections")
@@ -1153,9 +1162,15 @@ class FusionGUI:
                       cam_degraded=cam_degraded)
         level = fusion["level"]
 
-        # ── Motor control ─────────────────────────────────────────
+        # Motor control
         if self.motor:
             self.motor.update(level, fl, fc, fr)
+
+        # Data logging — only saves when obstacle detected
+        if self.logger:
+            motor_state = self.motor._state if self.motor else "UNKNOWN"
+            self.logger.log(level, fl, fc, fr,
+                            radar_tracks, cam_dets, motor_state)
 
         # ── Banner ────────────────────────────────────────────────
         self._set_banner(level)
@@ -1346,9 +1361,9 @@ class FusionGUI:
         if cam_frame is not None:
             try:
                 import cv2
-                disp = cv2.resize(cam_frame, (320, 320))
-                qimg = QtGui.QImage(disp.data, 320, 320,
-                                    320*3, QtGui.QImage.Format.Format_RGB888)
+                disp = cv2.resize(cam_frame, (640, 480))
+                qimg = QtGui.QImage(disp.data, 640, 480,
+                                    640*3, QtGui.QImage.Format.Format_RGB888)
                 self.cam_label.setPixmap(QtGui.QPixmap.fromImage(qimg))
                 if cam_dets:
                     det_str = "  ".join(
