@@ -15,17 +15,17 @@ CMD_RIGHT    = b'd'
 CMD_CENTRE   = b'c'
 
 # ── Distance thresholds ───────────────────────────────────────
-SIDE_STEER_M    = 2.0   # steer away from side obstacles within this
-CAUTION_M       = 2.0   # slow down when obstacle within this
-STOP_M          = 1.0   # trigger full stop+manoeuvre within this
-BYPASS_OPEN_M   = 1.0   # side must be this clear for bypass attempt
+SIDE_STEER_M    = 2.0
+CAUTION_M       = 2.0
+STOP_M          = 1.0
+BYPASS_OPEN_M   = 1.0
 
 # ── Manoeuvre timings ─────────────────────────────────────────
-STOP_TIME_S     = 0.5   # hold stop before reversing
-REVERSE_TIME_S  = 2.5   # reverse duration — increased for more clearance
-TURN_TIME_S     = 1.2   # turning duration — increased for better angle change
-ESCAPE_TIME_S   = 2.0   # forward escape duration
-STRAIGHT_TIME_S = 0.8   # re-centre before resuming
+STOP_TIME_S     = 0.5
+REVERSE_TIME_S  = 2.5
+TURN_TIME_S     = 1.2
+ESCAPE_TIME_S   = 2.0
+STRAIGHT_TIME_S = 0.8
 
 LOOP_HZ = 20
 
@@ -48,18 +48,22 @@ class MotorController:
         self._state         = self.NORMAL
         self._state_until   = 0.0
         self._escape_dir    = CMD_RIGHT
-        self._manoeuvre_start = 0.0   # tracks when full manoeuvre began
+        self._manoeuvre_start = 0.0
         self._lock          = threading.Lock()
         self._level         = "SAFE"
         self._fl            = None
         self._fc            = None
         self._fr            = None
         self._running       = True
+
+        # ✅ Anti-stuck additions
+        self._retry_count = 0
+        self._max_retries = 3
+
         threading.Thread(target=self._loop,         daemon=True).start()
         threading.Thread(target=self._listen_pause, daemon=True).start()
         print(f"[MOTOR] Ready -> {ARDUINO_IP}:{ARDUINO_PORT} @ {LOOP_HZ}Hz UDP")
 
-    # ── Pause listener ────────────────────────────────────────
     def _listen_pause(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -111,7 +115,6 @@ class MotorController:
             self._fc    = fc
             self._fr    = fr
 
-    # ── Main loop ─────────────────────────────────────────────
     def _loop(self):
         interval = 1.0 / LOOP_HZ
         while self._running:
@@ -128,7 +131,6 @@ class MotorController:
             if sleep > 0:
                 time.sleep(sleep)
 
-    # ── Core state machine ────────────────────────────────────
     def _process(self, level, fl, fc, fr):
         now = time.time()
         l = fl if fl is not None else 9.0
@@ -139,51 +141,61 @@ class MotorController:
             self._log_timer = now
             print(f"[MOTOR] {self._state} | L={l:.1f} C={c:.1f} R={r:.1f}")
 
-        # ── STOPPING ─────────────────────────────────────────
+        # STOPPING
         if self._state == self.STOPPING:
             self._send_throttle(CMD_STOP)
             self._send_steer(CMD_CENTRE)
             if now >= self._state_until:
-                # Pick escape direction toward more open side
-                self._escape_dir    = CMD_RIGHT if l >= r else CMD_LEFT
-                self._manoeuvre_start = now
-                print(f"[MOTOR] -> REVERSING (escape={'RIGHT' if self._escape_dir==CMD_RIGHT else 'LEFT'})")
+                self._escape_dir = CMD_RIGHT if l >= r else CMD_LEFT
+                print(f"[MOTOR] -> REVERSING")
                 self._state       = self.REVERSING
                 self._state_until = now + REVERSE_TIME_S
             return
 
-        # ── REVERSING ─────────────────────────────────────────
+        # REVERSING
         if self._state == self.REVERSING:
-            # Send reverse every tick — Arduino handles arming internally
             self._send_throttle(CMD_REVERSE)
-            self._send_steer(CMD_CENTRE)  # straight reverse
+            self._send_steer(CMD_CENTRE)
             if now >= self._state_until:
                 print("[MOTOR] -> TURNING")
                 self._state       = self.TURNING
                 self._state_until = now + TURN_TIME_S
             return
 
-        # ── TURNING ───────────────────────────────────────────
+        # TURNING (ANTI-STUCK LOGIC)
         if self._state == self.TURNING:
-            # Slow forward while steering — moving turn
+
+            if c <= STOP_M:
+                self._retry_count += 1
+                print(f"[MOTOR] Blocked during TURNING (retry {self._retry_count})")
+
+                if self._retry_count >= self._max_retries:
+                    self._retry_count = 0
+                    self._escape_dir = CMD_LEFT if self._escape_dir == CMD_RIGHT else CMD_RIGHT
+                    print("[MOTOR] Switching direction")
+
+                if self._retry_count >= self._max_retries * 2:
+                    print("[MOTOR] STUCK → FAILSAFE STOP")
+                    self._state = self.NORMAL
+                    self._send_throttle(CMD_STOP)
+                    self._send_steer(CMD_CENTRE)
+                    return
+
+                self._state       = self.REVERSING
+                self._state_until = now + REVERSE_TIME_S
+                return
+
             self._send_throttle(CMD_SLOW)
             self._send_steer(self._escape_dir)
+
             if now >= self._state_until:
                 print("[MOTOR] -> ESCAPING")
                 self._state       = self.ESCAPING
                 self._state_until = now + ESCAPE_TIME_S
             return
 
-        # ── ESCAPING ──────────────────────────────────────────
+        # ESCAPING
         if self._state == self.ESCAPING:
-            # Only abort escape if literally about to collide (20cm)
-            # Do NOT check STOP_M here — that would immediately re-trigger
-            if c <= 0.20:
-                print(f"[MOTOR] Emergency abort escape C={c:.1f}m")
-                self._escape_dir  = CMD_RIGHT if l >= r else CMD_LEFT
-                self._state       = self.STOPPING
-                self._state_until = now + STOP_TIME_S
-                return
             self._send_throttle(CMD_SLOW)
             self._send_steer(self._escape_dir)
             if now >= self._state_until:
@@ -192,48 +204,25 @@ class MotorController:
                 self._state_until = now + STRAIGHT_TIME_S
             return
 
-        # ── STRAIGHTENING ─────────────────────────────────────
+        # STRAIGHTENING
         if self._state == self.STRAIGHTENING:
             self._send_throttle(CMD_SLOW)
             self._send_steer(CMD_CENTRE)
             if now >= self._state_until:
                 print("[MOTOR] -> NORMAL")
                 self._state = self.NORMAL
+                self._retry_count = 0
             return
 
-        # ── NORMAL ────────────────────────────────────────────
-        # Reactive side steering
-        if l < SIDE_STEER_M and r < SIDE_STEER_M:
-            side_steer = CMD_RIGHT if l < r else CMD_LEFT
-        elif l < SIDE_STEER_M:
-            side_steer = CMD_RIGHT
-        elif r < SIDE_STEER_M:
-            side_steer = CMD_LEFT
-        else:
-            side_steer = CMD_CENTRE
-
+        # NORMAL
         if c <= STOP_M:
-            left_open  = l >= BYPASS_OPEN_M
-            right_open = r >= BYPASS_OPEN_M
-            if left_open or right_open:
-                # Bypass — steer around while slowing
-                bypass = CMD_LEFT if left_open and l >= r else CMD_RIGHT
-                print(f"[MOTOR] Bypass C={c:.1f}m -> {'LEFT' if bypass==CMD_LEFT else 'RIGHT'}")
-                self._send_throttle(CMD_SLOW)
-                self._send_steer(bypass)
-            else:
-                # Both sides blocked — full manoeuvre
-                print(f"[MOTOR] Blocked C={c:.1f}m L={l:.1f}m R={r:.1f}m -> STOPPING")
-                self._state       = self.STOPPING
-                self._state_until = now + STOP_TIME_S
-                self._send_throttle(CMD_STOP)
-                self._send_steer(CMD_CENTRE)
-        elif c <= CAUTION_M:
-            self._send_throttle(CMD_SLOW)
-            self._send_steer(side_steer)
-        else:
-            self._send_throttle(CMD_FORWARD)
-            self._send_steer(side_steer)
+            print(f"[MOTOR] Obstacle ahead -> STOPPING")
+            self._state       = self.STOPPING
+            self._state_until = now + STOP_TIME_S
+            return
+
+        self._send_throttle(CMD_FORWARD)
+        self._send_steer(CMD_CENTRE)
 
     def stop(self):
         self._running = False
