@@ -31,8 +31,12 @@ except ImportError:
     def _abs2(x): return (x.real**2 + x.imag**2).astype(np.float32)
 
 # ── Network ────────────────────────────────────────────────────────────────
-JETSON_IP   = "172.20.10.2"
+JETSON_IP   = "172.20.10.2"  # FIXED: Jetson Orin Nano IP
 JETSON_PORT = 9576
+
+# ── Radar mounting orientation ─────────────────────────────────────────────
+# Radar mounted sideways: antenna array faces forward, USB-C connector on top
+RADAR_ROTATION_DEG = -90  # Try +90 if detections are still missing
 
 # ── BGT60TR13C constants ───────────────────────────────────────────────────
 _R = lambda n: n  # just a tag for readability
@@ -214,9 +218,8 @@ def parse_cfg(s):
 
 # ── Radar processing ────────────────────────────────────────────────────────
 C=3e8; PM={1:(1,0),2:(0,1),3:(0,0)}; NAZ=2; MINR=0.2
-CFAR_DB=16.0; CGR=2;CTR=6;CGD=1;CTD=4   # higher threshold = only strong real targets
-MMISS=3;  GR=0.12; GV=0.40; SVEL=0.15    # MMISS=3: ghosts die in 3 missed frames (~150ms)
-                                           # SVEL=0.15: wider static dead-band
+CFAR_DB=12.0; CGR=2;CTR=6;CGD=1;CTD=4   # LOWERED from 16.0 for more sensitivity
+MMISS=3;  GR=0.12; GV=0.40; SVEL=0.20    # SVEL widened to 0.20 (was 0.15)
 TIMMINENT=1.5; TCAUTION=3.0; RIMMINENT=0.50; RCAUTION=1.20
 STATIC_CONFIRM_AGE  = 20
 STATIC_MIN_PWR_DB   = 0.0
@@ -224,11 +227,8 @@ STATIC_MIN_PWR_DB   = 0.0
 # Prevents single-frame velocity spikes from triggering false IMMINENT.
 APPROACH_CONFIRM    = 3
 
-# Angular FOV filter — only detections within ±FOV_DEG of boresight are kept.
-# BGT60TR13C physical antenna spacing is 0.5λ (half-wavelength) which gives
-# a theoretical unambiguous range of ±90°. We narrow this to forward-only.
-# Tighten FOV_DEG to reduce side-lobe false positives in cluttered environments.
-FOV_DEG = 45.0   # ±45° forward cone — matches camera CENTRE_ZONE_FRAC roughly
+# Angular FOV filter — DISABLED FOR DEBUG
+FOV_DEG = 90.0   # WIDENED from 45.0 to see all detections
 # Number of angle FFT bins — zero-pad the 2×2 virtual aperture for finer resolution
 NANGLE  = 64
 
@@ -399,6 +399,8 @@ def main():
     p=parse_cfg(setting)
     print(f"[RADAR]  {p['num_chirps']}chirps x {p['num_samples']}samp x {p['num_antennas']}RX  BW={p['bandwidth']/1e9:.1f}GHz")
     print(f"[NET]    Streaming JSON to {JETSON_IP}:{JETSON_PORT}")
+    print(f"[MOUNT]  Radar rotation: {RADAR_ROTATION_DEG}° (USB-C on top)")
+    print(f"[DEBUG]  CFAR={CFAR_DB}dB, FOV={FOV_DEG}°, SVEL={SVEL}m/s")
 
     sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
 
@@ -409,7 +411,8 @@ def main():
         radar.set_register_config_file(reg_file)
         radar.set_fifo_parameters(frame_size,4096,2048)
         radar.start()
-        print("[HW]     Started.")
+        print("[HW]     Started. MTI settling for ~2 seconds...")
+        time.sleep(2)  # Let MTI filter stabilize
     except Exception as e:
         print(f"[ERROR]  {e}"); sys.exit(1)
 
@@ -431,7 +434,16 @@ def main():
                 # Get angle for this detection from the angle map
                 ai = int(angle_map[ri, di]) if angle_map is not None else NANGLE//2
                 ang = float(cube.angle_axis[ai]) if ai < len(cube.angle_axis) else 0.0
-                # FOV filter — discard detections outside the forward cone
+                
+                # Apply mounting rotation: radar is sideways with USB-C on top
+                ang = ang + RADAR_ROTATION_DEG
+                # Normalize to -180..+180 range
+                if ang > 180:
+                    ang -= 360
+                elif ang < -180:
+                    ang += 360
+                
+                # FOV filter — WIDENED TO 90° FOR DEBUG, effectively disabled
                 if abs(ang) > FOV_DEG:
                     continue
                 dets.append((r, v, pw, ang))
@@ -446,7 +458,7 @@ def main():
             sock.sendto(msg.encode(),(JETSON_IP,JETSON_PORT))
             sent+=1
             if sent%50==0:
-                print(f"[TX] {sent} frames  tracks={len(tracks)}  worst={worst}")
+                print(f"[TX] {sent} frames  dets={len(dets)}  tracks={len(tracks)}  worst={worst}")
     except KeyboardInterrupt:
         print("\n[EXIT]")
     finally:

@@ -1168,9 +1168,8 @@ class FusionGUI:
 
         # Data logging — only saves when obstacle detected
         if self.logger:
-            motor_state = self.motor._state if self.motor else "UNKNOWN"
             self.logger.log(level, fl, fc, fr,
-                            radar_tracks, cam_dets, motor_state)
+                            radar_tracks, cam_dets, self.motor)
 
         # ── Banner ────────────────────────────────────────────────
         self._set_banner(level)
