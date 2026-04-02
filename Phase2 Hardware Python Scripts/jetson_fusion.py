@@ -32,8 +32,12 @@ LIDAR_BAUD      = 230400
 
 # RC car geometry (from ld06_corridor.py)
 RC_CAR_WIDTH_M      = 0.191
-HALF_WIDTH_M        = RC_CAR_WIDTH_M / 2 + 0.025   # ~0.12 m
-CENTER_HALF_WIDTH_M = RC_CAR_WIDTH_M / 2
+# HALF_WIDTH_M: total corridor width — only points within this lateral
+# distance are considered. Kept tight so side walls don't bleed into zones.
+HALF_WIDTH_M        = RC_CAR_WIDTH_M / 2 + 0.05    # ~0.145 m total half-width
+# CENTER_HALF_WIDTH_M: only this narrow band counts as FC (directly ahead)
+# Narrowed so a thin object like a bottle only triggers FC, not FL+FC+FR
+CENTER_HALF_WIDTH_M = 0.06   # 12 cm total centre zone (was ~19 cm)
 LOOKAHEAD_M         = 3.0
 STOP_DIST_M         = 0.80
 SLOW_DIST_M         = 1.80
@@ -52,14 +56,14 @@ GUI_FPS = 15
 # Camera
 # IMX477 on Jetson Orin Nano JetPack 6 — nvarguscamerasrc confirmed working
 CAM_PIPELINE     = ("nvarguscamerasrc sensor-id=0 ! "
-                    "video/x-raw(memory:NVMM), width=1920, height=1080, framerate=30/1 ! "
+                    "video/x-raw(memory:NVMM), width=1280, height=720, framerate=30/1 ! "
                     "nvvidconv ! video/x-raw, width=416, height=416, format=BGRx ! "
                     "videoconvert ! video/x-raw, format=BGR ! "
                     "queue leaky=downstream max-size-buffers=1 max-size-time=0 max-size-bytes=0 ! "
                     "appsink drop=true max-buffers=1 sync=false emit-signals=false")
 CAM_FALLBACK     = 0          # fallback index if GStreamer fails
-CAM_WIDTH        = 640
-CAM_HEIGHT       = 480
+CAM_WIDTH        = 1920
+CAM_HEIGHT       = 1080
 # Centre zone: middle 40% of frame width triggers collision warning
 CENTRE_ZONE_FRAC = 0.40       # fraction of frame width considered "directly ahead"
 YOLO_CONF        = 0.40       # minimum confidence threshold
@@ -144,11 +148,14 @@ CAM_DARK_THRESHOLD    = 40  # mean frame brightness below this → lens blocked/
 #   d < 1.5m  → 4 points
 #   d < 2.5m  → 3 points
 #   d >= 2.5m → 2 points  (sparse returns at range, accept lower density)
+# Raised minimum points — a thin object like a bottle only produces
+# 2-3 scan returns. Requiring more points means it only triggers FC
+# not all three zones simultaneously.
 ZONE_MIN_PTS_THRESHOLDS = [
-    (0.5,  6),
-    (1.0,  5),
-    (1.5,  4),
-    (2.5,  3),
+    (0.5,  4),
+    (1.0,  3),
+    (1.5,  3),
+    (2.5,  2),
     (float('inf'), 2),
 ]
 
@@ -652,24 +659,24 @@ class CameraDetector(threading.Thread):
         # Try multiple pipelines in order
         # Arducam B0262 IMX477 Mini — 2-lane MIPI, 3.9mm M12 lens, 80 deg FOV
         pipelines = [
-            # Pipeline 1: native 640x480 — widest FOV, least zoom
+            # Pipeline 1: 1920x1080 full colour
             ("nvarguscamerasrc sensor-id=0 ! "
-             "video/x-raw(memory:NVMM), width=640, height=480, framerate=60/1 ! "
-             "nvvidconv ! "
-             "video/x-raw, width=640, height=480, format=BGRx ! "
+             "video/x-raw(memory:NVMM), width=1920, height=1080, framerate=60/1 ! "
+             "nvvidconv ! video/x-raw(memory:NVMM), format=I420 ! "
+             "nvvidconv ! video/x-raw, format=BGRx ! "
              "videoconvert ! video/x-raw, format=BGR ! "
              "queue leaky=downstream max-size-buffers=1 ! "
              "appsink drop=1 max-buffers=1 sync=false"),
-            # Pipeline 2: 1280x720 downscaled
+            # Pipeline 2: fallback with explicit colour space
             ("nvarguscamerasrc sensor-id=0 ! "
-             "video/x-raw(memory:NVMM), width=1280, height=720, framerate=30/1 ! "
-             "nvvidconv ! video/x-raw, width=640, height=480, format=BGRx ! "
+             "video/x-raw(memory:NVMM), width=1920, height=1080, framerate=60/1 ! "
+             "nvvidconv flip-method=0 ! video/x-raw, format=BGRx ! "
              "videoconvert ! video/x-raw, format=BGR ! "
              "appsink drop=1 max-buffers=1 sync=false"),
-            # Pipeline 3: let nvargus pick
+            # Pipeline 3: let nvargus pick, force colour conversion
             ("nvarguscamerasrc sensor-id=0 ! "
              "video/x-raw(memory:NVMM) ! "
-             "nvvidconv ! video/x-raw, width=640, height=480, format=BGRx ! "
+             "nvvidconv ! video/x-raw, format=BGRx ! "
              "videoconvert ! video/x-raw, format=BGR ! "
              "appsink drop=1 max-buffers=1 sync=false"),
         ]
@@ -798,8 +805,8 @@ class CameraDetector(threading.Thread):
                 last_dets = list(self.detections)
 
             display = frame.copy()
-            cv2.line(display, (int(cx_min),0), (int(cx_min),h), (0,200,200), 1)
-            cv2.line(display, (int(cx_max),0), (int(cx_max),h), (0,200,200), 1)
+            cv2.line(display, (int(cx_min),0), (int(cx_min),h), (0,200,200), 2)
+            cv2.line(display, (int(cx_max),0), (int(cx_max),h), (0,200,200), 2)
             for d in last_dets:
                 if d.get("foreign"):
                     col = (0,165,255)

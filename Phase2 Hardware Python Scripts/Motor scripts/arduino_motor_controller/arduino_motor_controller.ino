@@ -3,6 +3,7 @@
   ESC      -> pin 9
   Servo    -> pin 10
   WiFi UDP -> port 5005
+  Static IP: 172.20.10.3
 
   Reverse sequence:
     BRAKE (1300us, 200ms) -> NEUTRAL (1500us, 300ms) -> REVERSE (1300us held)
@@ -21,6 +22,13 @@ const char* ssid     = "Raffay";
 const char* password = "22997788";
 const int   UDP_PORT = 5005;
 WiFiUDP udp;
+
+// ── Static IP configuration ───────────────────────────────────
+IPAddress staticIP (172, 20, 10, 3);
+IPAddress gateway  (172, 20, 10, 1);
+IPAddress subnet   (255, 255, 255, 0);
+IPAddress dns      (8,   8,   8,  8);
+// ─────────────────────────────────────────────────────────────
 
 enum ReverseState { IDLE, BRAKE, NEUTRAL_WAIT, REVERSING };
 ReverseState  revState    = IDLE;
@@ -79,9 +87,7 @@ void handleCmd(char cmd) {
       break;
 
     case 'r':
-      if (!reverseArmed) {
-        startReverse();
-      }
+      if (!reverseArmed) startReverse();
       Serial.println("REV");
       break;
 
@@ -114,16 +120,10 @@ void setup() {
   delay(5000);
   Serial.println("ESC armed - connecting WiFi");
 
-  // ✅ Static IP config (fixed for WiFiS3)
-  IPAddress staticIP(172, 20, 10, 3);
-  IPAddress gateway(172, 20, 10, 1);
-  IPAddress subnet(255, 255, 255, 0);
-  IPAddress dns(172, 20, 10, 1);
-
+  // Configure static IP before connecting
   WiFi.config(staticIP, dns, gateway, subnet);
 
   WiFi.begin(ssid, password);
-
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 30) {
     delay(500); Serial.print("."); attempts++;
@@ -131,11 +131,8 @@ void setup() {
 
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("\nWiFi connected!");
-    IPAddress ip = WiFi.localIP();
-    Serial.print(ip[0]); Serial.print(".");
-    Serial.print(ip[1]); Serial.print(".");
-    Serial.print(ip[2]); Serial.print(".");
-    Serial.println(ip[3]);
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
     udp.begin(UDP_PORT);
     Serial.println("Ready - listening on UDP 5005");
   } else {
