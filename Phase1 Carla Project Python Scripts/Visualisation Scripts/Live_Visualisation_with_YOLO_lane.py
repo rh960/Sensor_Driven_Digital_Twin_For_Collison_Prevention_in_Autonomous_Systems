@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 import pandas as pd
 import glob
 import time
@@ -46,14 +47,14 @@ def load_ply(filepath):
     
     return np.array(points) if points else None
 
-def load_yolo_model():
-    """Load YOLOv8 model with smart device selection"""
+def load_yolo_model(weight_path='yolov5n.pt'):
+    """Load YOLO model with smart device selection"""
     try:
         from ultralytics import YOLO
         import torch
         
-        print("📦 Loading YOLOv8 model...")
-        model = YOLO('yolov8n.pt')  # Nano model (fastest)
+        print(f"📦 Loading YOLO model: {weight_path} ...")
+        model = YOLO(weight_path)
         
         # Smart device selection
         if torch.cuda.is_available():
@@ -80,63 +81,127 @@ def load_yolo_model():
         print(f"⚠️  YOLO load failed: {e}\n")
         return None
 
+def _extrapolate_line(line_segments, y_bottom, y_top):
+    """Fit a single line through all segments and return (x_bottom, y_bottom, x_top, y_top)."""
+    if not line_segments:
+        return None
+    pts = np.array([[x1, y1] for x1, y1, x2, y2 in line_segments] +
+                   [[x2, y2] for x1, y1, x2, y2 in line_segments], dtype=np.float32)
+    if len(pts) < 2:
+        return None
+    vx, vy, x0, y0 = cv2.fitLine(pts, cv2.DIST_L2, 0, 0.01, 0.01)
+    # cv2 returns (1,) arrays; explicitly squeeze to plain scalars
+    vx, vy, x0, y0 = [float(v.ravel()[0]) for v in (vx, vy, x0, y0)]
+    if abs(vy) < 1e-6:
+        return None
+    x_bot = int(x0 + (vx / vy) * (y_bottom - y0))
+    x_top = int(x0 + (vx / vy) * (y_top   - y0))
+    return x_bot, y_bottom, x_top, y_top
+
+
 def detect_lane_mask(image):
-    """Detect drivable lane area using simple color-based segmentation"""
-    # Convert to HSV for better road detection
-    hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
-    
-    # Define range for road (gray/dark colors)
-    lower_road = np.array([0, 0, 40])
-    upper_road = np.array([180, 50, 140])
-    
-    # Create mask for road
-    road_mask = cv2.inRange(hsv, lower_road, upper_road)
-    
-    # Focus on bottom half (where road is)
+    """Detect ego-lane boundaries via Hough lines and fill the lane polygon."""
     h, w = image.shape[:2]
-    roi_mask = np.zeros_like(road_mask)
-    
-    # Trapezoidal ROI for lane (perspective view)
-    vertices = np.array([[
-        (int(w * 0.1), h),           # Bottom left
-        (int(w * 0.4), int(h * 0.6)), # Top left
-        (int(w * 0.6), int(h * 0.6)), # Top right
-        (int(w * 0.9), h)             # Bottom right
+    # Horizon for lane detection; keep on-road to avoid sky artifacts
+    y_top = int(h * 0.60)
+
+    # ── Edge detection ──────────────────────────────────────────────────────
+    gray    = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges   = cv2.Canny(blurred, 50, 150)
+
+    # Restrict edges to a trapezoidal ROI (road area only)
+    roi = np.zeros_like(edges)
+    roi_verts = np.array([[
+        (int(w * 0.10), h),
+        (int(w * 0.45), y_top),
+        (int(w * 0.55), y_top),
+        (int(w * 0.90), h)
     ]], dtype=np.int32)
-    
-    cv2.fillPoly(roi_mask, vertices, 255)
-    
-    # Combine road mask with ROI
-    lane_mask = cv2.bitwise_and(road_mask, roi_mask)
-    
-    # Clean up with morphology
-    kernel = np.ones((5,5), np.uint8)
-    lane_mask = cv2.morphologyEx(lane_mask, cv2.MORPH_CLOSE, kernel)
-    lane_mask = cv2.morphologyEx(lane_mask, cv2.MORPH_OPEN, kernel)
-    
+    cv2.fillPoly(roi, roi_verts, 255)
+    edges = cv2.bitwise_and(edges, roi)
+
+    # ── Hough lines ─────────────────────────────────────────────────────────
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=30,
+                            minLineLength=30, maxLineGap=200)
+
+    left_segs, right_segs = [], []
+    if lines is not None:
+        for x1, y1, x2, y2 in lines[:, 0]:
+            if x2 == x1:
+                continue
+            slope = (y2 - y1) / (x2 - x1)
+            mid_x = (x1 + x2) / 2
+            if slope < -0.3 and mid_x < w * 0.55:   # left lane line
+                left_segs.append((x1, y1, x2, y2))
+            elif slope > 0.3 and mid_x > w * 0.45:  # right lane line
+                right_segs.append((x1, y1, x2, y2))
+
+    left  = _extrapolate_line(left_segs,  h, y_top)
+    right = _extrapolate_line(right_segs, h, y_top)
+
+    # ── Build lane polygon ───────────────────────────────────────────────────
+    if left is not None and right is not None:
+        vertices = np.array([[
+            (left[0],  left[1]),    # bottom-left
+            (left[2],  left[3]),    # top-left
+            (right[2], right[3]),   # top-right
+            (right[0], right[1])    # bottom-right
+        ]], dtype=np.int32)
+    else:
+        # Fallback: fixed single-lane trapezoid (centered)
+        vertices = np.array([[
+            (int(w * 0.25), h),
+            (int(w * 0.45), y_top),
+            (int(w * 0.55), y_top),
+            (int(w * 0.75), h)
+        ]], dtype=np.int32)
+
+    lane_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(lane_mask, vertices, 255)
+    # Light morphology to avoid bloating into shoulders
+    lane_mask = cv2.dilate(lane_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+    lane_mask = cv2.morphologyEx(lane_mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
     return lane_mask, vertices
 
 def is_object_in_lane(bbox, lane_mask, image_height):
     """Check if object is in the detected lane"""
     x1, y1, x2, y2 = bbox
+    h, w = lane_mask.shape[:2]
+    
+    # Clip bbox to image bounds
+    x1c = max(0, min(w - 1, x1))
+    x2c = max(0, min(w - 1, x2))
+    y1c = max(0, min(h - 1, y1))
+    y2c = max(0, min(h - 1, y2))
+    if x2c <= x1c or y2c <= y1c:
+        return False
     
     # Get bottom center of bounding box (where vehicle touches ground)
-    center_x = int((x1 + x2) / 2)
-    bottom_y = int(y2)
+    center_x = int((x1c + x2c) / 2)
+    bottom_y = int(y2c)
     
-    # Check if this point is in lane mask
+    # Primary test: lane overlap ratio inside the box (captures far objects)
+    lane_crop = lane_mask[y1c:y2c, x1c:x2c]
+    if lane_crop.size > 0:
+        lane_ratio = np.mean(lane_crop > 0)
+        if lane_ratio > 0.20:
+            return True
+    
+    # Secondary test: generous strip around contact point (for close vehicles)
     if 0 <= center_x < lane_mask.shape[1] and 0 <= bottom_y < lane_mask.shape[0]:
-        # Check a small region around the bottom center
-        check_region = lane_mask[max(0, bottom_y-10):min(lane_mask.shape[0], bottom_y+10),
-                                 max(0, center_x-20):min(lane_mask.shape[1], center_x+20)]
-        
-        # If more than 30% of region is lane, object is in lane
-        return np.sum(check_region > 0) > (check_region.size * 0.3)
+        check_region = lane_mask[max(0, bottom_y - 60):min(lane_mask.shape[0], bottom_y + 20),
+                                 max(0, center_x - 40):min(lane_mask.shape[1], center_x + 40)]
+
+        return np.sum(check_region > 0) > (check_region.size * 0.10)
     
     return False
 
 def run_yolo_detection(model, image):
     """Run YOLO with lane detection - only detect objects in ego lane"""
+    if image is None:
+        print("Detection error: received empty frame (image is None)")
+        return None, [], 0.0
     if model is None:
         return image, [], 0.0
     
@@ -156,9 +221,10 @@ def run_yolo_detection(model, image):
         all_detections = []  # Track all for comparison
         
         for box in results.boxes:
-            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-            conf = float(box.conf[0])
-            cls = int(box.cls[0])
+            # Convert tensors to plain Python scalars to avoid numpy scalar conversion issues
+            x1, y1, x2, y2 = [float(v) for v in box.xyxy[0].cpu().tolist()]
+            conf = float(box.conf.cpu().item())
+            cls = int(box.cls.cpu().item())
             label = results.names[cls]
             
             bbox = (int(x1), int(y1), int(x2), int(y2))
@@ -244,7 +310,15 @@ def run_yolo_detection(model, image):
         return annotated, detections, inference_time
     
     except Exception as e:
+        import traceback
+        trace = traceback.format_exc()
         print(f"Detection error: {e}")
+        print(trace)
+        try:
+            with open("last_detection_error.txt", "w", encoding="utf-8") as f:
+                f.write(trace)
+        except Exception:
+            pass
         return image, [], 0.0
 
 def visualize_lidar_frame(pts, ax, fused_dist, action, ttc, radar_dist):
@@ -578,41 +652,18 @@ def create_performance_graphs(perf_df, output_dir):
     
     print(f"\n📊 All graphs saved to: {output_dir}\n")
 
-def main():
-    print("\n" + "="*70)
-    print("🚀 ULTRA-FAST PLAYBACK WITH YOLO ANALYSIS")
-    print("="*70 + "\n")
-    
-    # === MODE SELECTION ===
-    print("Select mode:")
-    print("1. HEADLESS (no visualization - MAXIMUM SPEED)")
-    print("2. FAST DISPLAY (update every 10 frames)")
-    print("3. NORMAL (update every frame)")
-    mode_choice = input("Enter choice [1/2/3, default=2]: ").strip() or "2"
-    
-    HEADLESS = (mode_choice == "1")
-    DISPLAY_UPDATE_INTERVAL = 1 if mode_choice == "3" else (999999 if HEADLESS else 10)
-    
-    print(f"\n{'🔥 HEADLESS MODE' if HEADLESS else f'📺 DISPLAY MODE (update every {DISPLAY_UPDATE_INTERVAL} frames)'}\n")
-    
-    log_base = "/home/rh960/carla_env/dt_logs"
-    run_dir = os.path.join(log_base, "20260211_130643_collision_avoidance")
-    
-    if not os.path.exists(run_dir):
-        print(f"❌ Directory not found: {run_dir}")
-        return
-    
-    # Create separate output folder with timestamp
-    from datetime import datetime
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = os.path.join(run_dir, f"yolo_results_{timestamp}")
+def process_model(model_weight, model_tag, HEADLESS, DISPLAY_UPDATE_INTERVAL, run_dir, base_output_dir):
+    """Run the full pipeline for a single YOLO model; returns performance DataFrame."""
+    output_dir = os.path.join(base_output_dir, model_tag)
     os.makedirs(output_dir, exist_ok=True)
-    
-    print(f"📁 Input:  {run_dir}")
-    print(f"📁 Output: {output_dir}\n")
-    
+
+    cam_video_path = os.path.join(output_dir, f"{model_tag}_camera_yolo_video.mp4")
+    vis_video_path = os.path.join(output_dir, f"{model_tag}_visualisation_video.mp4")
+    cam_video_writer = None
+    vis_video_writer = None
+
     # Load YOLO
-    yolo_model = load_yolo_model()
+    yolo_model = load_yolo_model(model_weight)
     
     # Load data
     fusion_df = pd.read_csv(os.path.join(run_dir, "sensor_fusion.csv"))
@@ -621,29 +672,32 @@ def main():
     camera_frames = sorted(glob.glob(os.path.join(run_dir, "camera", "*.jpg")))
     lidar_files = sorted(glob.glob(os.path.join(run_dir, "lidar", "*.ply")))
     
+    print(f"\n=== MODEL: {model_tag} | Weight: {model_weight} ===")
     print(f"✅ {len(camera_frames)} camera frames")
     print(f"✅ {len(lidar_files)} LiDAR clouds")
     print(f"✅ YOLO: {'GPU' if yolo_model else 'Disabled'}\n")
-    
-    # Performance tracking
+
     perf_data = []
-    
-    # Setup figure (only if not headless)
+
+    # Always build the visualization figure so we can save vis videos even in headless mode
     if not HEADLESS:
         plt.ion()
-        fig = plt.figure(figsize=(18, 8))
-        ax_cam = fig.add_subplot(1, 2, 1)
-        ax_lidar = fig.add_subplot(1, 2, 2)
-        plt.tight_layout(pad=1)
     else:
-        fig = ax_cam = ax_lidar = None
-    
+        plt.ioff()
+    fig = plt.figure(figsize=(18, 8))
+    ax_cam = fig.add_subplot(1, 2, 1)
+    ax_lidar = fig.add_subplot(1, 2, 2)
+    if HEADLESS:
+        canvas = FigureCanvasAgg(fig)
+        fig.set_canvas(canvas)
+    plt.tight_layout(pad=1)
+
     print("🎬 Processing...\n")
-    
-    # SPEED SETTINGS
     num_frames = min(len(camera_frames), len(lidar_files))
     current_frame = 0
-    
+    start_playback = time.time()
+    vis_capture_interval = 1 if HEADLESS else DISPLAY_UPDATE_INTERVAL
+
     def get_data(idx):
         if idx < len(fusion_df):
             f = fusion_df.iloc[idx]
@@ -662,19 +716,21 @@ def main():
             action, speed, time_s = 'UNKNOWN', 0.0, 0.0
         
         return fused_dist, ttc, action, speed, time_s, radar_dist
-    
-    start_playback = time.time()
-    
+
     try:
-        while current_frame < num_frames and (HEADLESS or plt.fignum_exists(fig.number)):
-            # Load image
+        while current_frame < num_frames:
             cam_img = cv2.imread(camera_frames[current_frame])
             cam_img = cv2.cvtColor(cam_img, cv2.COLOR_BGR2RGB)
             
-            # YOLO detection with timing (ALWAYS RUN - this is what we're measuring!)
             cam_annotated, detections, inf_time = run_yolo_detection(yolo_model, cam_img)
-            
-            # Record performance
+
+            frame_bgr = cv2.cvtColor(cam_annotated, cv2.COLOR_RGB2BGR)
+            if cam_video_writer is None:
+                h_f, w_f = frame_bgr.shape[:2]
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                cam_video_writer = cv2.VideoWriter(cam_video_path, fourcc, 15, (w_f, h_f))
+            cam_video_writer.write(frame_bgr)
+
             detected_classes = ';'.join([d['class'] for d in detections]) if detections else ''
             perf_data.append({
                 'frame': current_frame,
@@ -685,12 +741,8 @@ def main():
             
             fused_dist, ttc, action, speed, time_s, radar_dist = get_data(current_frame)
             
-            # === UPDATE DISPLAY ONLY EVERY N FRAMES ===
-            if current_frame % DISPLAY_UPDATE_INTERVAL == 0:
-                # Load LiDAR
+            if current_frame % vis_capture_interval == 0:
                 lidar_pts = load_ply(lidar_files[current_frame])
-                
-                # === CAMERA VIEW ===
                 ax_cam.clear()
                 ax_cam.imshow(cam_annotated)
                 
@@ -711,39 +763,51 @@ def main():
                            bbox=dict(boxstyle='round,pad=0.6', facecolor='black', 
                                     edgecolor=box_color, alpha=0.8, linewidth=2))
                 
-                ax_cam.set_title('Camera + YOLO (Lane Detection - Objects in Ego Lane Only)', 
+                ax_cam.set_title(f'Camera + {model_tag} (Lane Detection - Objects in Ego Lane Only)', 
                                fontsize=12, fontweight='bold')
                 ax_cam.axis('off')
                 
-                # === LIDAR VIEW ===
                 visualize_lidar_frame(lidar_pts, ax_lidar, fused_dist, action, ttc, radar_dist)
                 
-                # Minimal pause for display update
-                plt.pause(0.001)
-            
+                if not HEADLESS:
+                    plt.pause(0.001)
+                fig.canvas.draw()
+                buf = np.asarray(fig.canvas.buffer_rgba())
+                vis_frame = buf[:, :, :3]
+                fig_w, fig_h = vis_frame.shape[1], vis_frame.shape[0]
+                vis_frame_bgr = cv2.cvtColor(vis_frame, cv2.COLOR_RGB2BGR)
+                if vis_video_writer is None:
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    vis_video_writer = cv2.VideoWriter(vis_video_path, fourcc, 15, (fig_w, fig_h))
+                vis_video_writer.write(vis_frame_bgr)
+
             current_frame += 1
             
             if current_frame % 100 == 0:
                 elapsed = time.time() - start_playback
                 fps = current_frame / elapsed
-                print(f"Frame {current_frame}/{num_frames} | Playback: {fps:.1f} FPS | "
+                print(f"[{model_tag}] Frame {current_frame}/{num_frames} | Playback: {fps:.1f} FPS | "
                       f"{len(detections)} objects detected")
         
         total_time = time.time() - start_playback
-        print(f"\n✅ Playback complete in {total_time:.1f}s")
+        print(f"\n✅ [{model_tag}] Playback complete in {total_time:.1f}s")
         print(f"   Average playback speed: {num_frames/total_time:.1f} FPS\n")
+
+        if cam_video_writer is not None:
+            cam_video_writer.release()
+            print(f"✅ [{model_tag}] Camera video saved: {cam_video_path}")
+        if vis_video_writer is not None:
+            vis_video_writer.release()
+            print(f"✅ [{model_tag}] Visualisation video saved: {vis_video_path}")
         
-        # Save performance CSV
-        if perf_data:
-            perf_df = pd.DataFrame(perf_data)
+        perf_df = pd.DataFrame(perf_data)
+        if not perf_df.empty:
             csv_path = os.path.join(output_dir, "yolo_performance.csv")
             perf_df.to_csv(csv_path, index=False)
-            print(f"✅ Performance CSV: {csv_path}")
+            print(f"✅ [{model_tag}] Performance CSV: {csv_path}")
             
-            # Copy original CSV files to output folder for complete record
-            print(f"\n📋 Copying original data files...")
             import shutil
-            
+            print(f"\n📋 Copying original data files...")
             csv_files_to_copy = [
                 'sensor_fusion.csv',
                 'vehicle_state.csv',
@@ -760,7 +824,6 @@ def main():
                 else:
                     print(f"  ⚠️  Not found: {csv_file}")
             
-            # Create a summary CSV with key metrics
             summary_data = {
                 'Metric': [
                     'Total Frames',
@@ -801,23 +864,12 @@ def main():
             summary_df.to_csv(summary_path, index=False)
             print(f"  ✅ Created: yolo_summary.csv\n")
             
-            # Print statistics
-            print(f"\n📊 YOLO PERFORMANCE STATISTICS:")
-            print(f"   Mean inference time: {perf_df['inference_time_ms'].mean():.2f} ms")
-            print(f"   Min inference time:  {perf_df['inference_time_ms'].min():.2f} ms")
-            print(f"   Max inference time:  {perf_df['inference_time_ms'].max():.2f} ms")
-            print(f"   Mean FPS: {(1000/perf_df['inference_time_ms']).mean():.1f}")
-            print(f"   Total detections: {perf_df['num_detections'].sum()}")
-            print(f"   Avg detections/frame: {perf_df['num_detections'].mean():.2f}")
-            
-            # Create graphs
             create_performance_graphs(perf_df, output_dir)
-        
-        # List all files in output directory
+
+        # List files
         print(f"\n{'='*70}")
-        print(f"📁 ALL FILES SAVED TO: {output_dir}")
+        print(f"📁 [{model_tag}] FILES SAVED TO: {output_dir}")
         print(f"{'='*70}\n")
-        
         print("📊 CSV Files:")
         csv_files = sorted([f for f in os.listdir(output_dir) if f.endswith('.csv')])
         for csv_file in csv_files:
@@ -833,18 +885,227 @@ def main():
             print(f"  • {graph_file:<30} ({file_size:.1f} KB)")
         
         print(f"\n{'='*70}\n")
-        
-        if not HEADLESS:
-            print("\nClose window to exit...")
-            plt.ioff()
-            plt.show()
-        else:
-            print("\n✅ Processing complete! Check CSV and graphs.\n")
-    
+        return perf_df
+
     except KeyboardInterrupt:
-        print("\n⏹️  Stopped\n")
+        print(f"\n⏹️  [{model_tag}] Stopped\n")
+        if cam_video_writer is not None:
+            cam_video_writer.release()
+            print(f"✅ Camera video saved (partial): {cam_video_path}")
+        if vis_video_writer is not None:
+            vis_video_writer.release()
+            print(f"✅ Visualisation video saved (partial): {vis_video_path}")
+        return pd.DataFrame()
     finally:
         plt.close('all')
+
+
+def create_comparison_charts(perf_a, perf_b, labels, output_dir):
+    """Create multiple comparison charts between two models."""
+    if perf_a.empty or perf_b.empty:
+        print("Comparison skipped: one of the perf dataframes is empty.")
+        return
+
+    # Derived FPS
+    fps_a = 1000 / perf_a['inference_time_ms']
+    fps_b = 1000 / perf_b['inference_time_ms']
+
+    # --- Chart 1: Aggregate metrics bar ---
+    metrics = [
+        ("Mean Inference Time (ms)", perf_a['inference_time_ms'].mean(), perf_b['inference_time_ms'].mean()),
+        ("Median Inference Time (ms)", perf_a['inference_time_ms'].median(), perf_b['inference_time_ms'].median()),
+        ("Mean FPS", fps_a.mean(), fps_b.mean()),
+        ("Total Detections", perf_a['num_detections'].sum(), perf_b['num_detections'].sum()),
+        ("Mean Detections/Frame", perf_a['num_detections'].mean(), perf_b['num_detections'].mean()),
+    ]
+    fig, ax = plt.subplots(figsize=(9, 5))
+    x = np.arange(len(metrics))
+    width = 0.35
+    ax.bar(x - width/2, [m[1] for m in metrics], width, label=labels[0], color='steelblue')
+    ax.bar(x + width/2, [m[2] for m in metrics], width, label=labels[1], color='orange')
+    ax.set_xticks(x)
+    ax.set_xticklabels([m[0] for m in metrics], rotation=20, ha='right')
+    ax.legend()
+    ax.set_title('YOLO Model Comparison - Key Metrics')
+    ax.grid(True, axis='y', alpha=0.3)
+    plt.tight_layout()
+    path_bar = os.path.join(output_dir, "yolo_comparison_metrics.png")
+    plt.savefig(path_bar, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"✅ Comparison chart: {path_bar}")
+
+    # --- Chart 2: Inference time histogram overlay ---
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.hist(perf_a['inference_time_ms'], bins=40, alpha=0.6, label=labels[0], color='steelblue')
+    ax.hist(perf_b['inference_time_ms'], bins=40, alpha=0.6, label=labels[1], color='orange')
+    ax.set_xlabel('Inference Time (ms)')
+    ax.set_ylabel('Frames')
+    ax.set_title('Inference Time Distribution')
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    plt.tight_layout()
+    path_hist = os.path.join(output_dir, "yolo_comparison_inftime_hist.png")
+    plt.savefig(path_hist, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"✅ Comparison chart: {path_hist}")
+
+    # --- Chart 3: Per-frame inference time series (downsampled if long) ---
+    fig, ax = plt.subplots(figsize=(10, 4))
+    step = max(1, len(perf_a) // 2000)  # keep plots light
+    ax.plot(perf_a['frame'][::step], perf_a['inference_time_ms'][::step], label=labels[0], color='steelblue', linewidth=1)
+    ax.plot(perf_b['frame'][::step], perf_b['inference_time_ms'][::step], label=labels[1], color='orange', linewidth=1)
+    ax.set_xlabel('Frame')
+    ax.set_ylabel('Inference Time (ms)')
+    ax.set_title('Inference Time per Frame')
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    plt.tight_layout()
+    path_series = os.path.join(output_dir, "yolo_comparison_inftime_series.png")
+    plt.savefig(path_series, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"✅ Comparison chart: {path_series}")
+
+    # --- Chart 4: Detections per frame series ---
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(perf_a['frame'], perf_a['num_detections'], label=labels[0], color='steelblue', alpha=0.8)
+    ax.plot(perf_b['frame'], perf_b['num_detections'], label=labels[1], color='orange', alpha=0.8)
+    ax.set_xlabel('Frame')
+    ax.set_ylabel('# Detections')
+    ax.set_title('Detections per Frame')
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    plt.tight_layout()
+    path_det_series = os.path.join(output_dir, "yolo_comparison_detections_series.png")
+    plt.savefig(path_det_series, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"✅ Comparison chart: {path_det_series}")
+
+    # --- Chart 5: FPS boxplot ---
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.boxplot([fps_a, fps_b], labels=labels, patch_artist=True,
+               boxprops=dict(facecolor='lightblue'),
+               medianprops=dict(color='red'))
+    ax.set_ylabel('FPS')
+    ax.set_title('FPS Distribution')
+    ax.grid(True, axis='y', alpha=0.3)
+    plt.tight_layout()
+    path_fps_box = os.path.join(output_dir, "yolo_comparison_fps_box.png")
+    plt.savefig(path_fps_box, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"✅ Comparison chart: {path_fps_box}")
+
+
+def create_side_by_side_video(video_a, video_b, label_a, label_b, output_path):
+    """Combine two videos side-by-side with labels."""
+    if not (os.path.exists(video_a) and os.path.exists(video_b)):
+        print(f"Side-by-side skipped (missing video): {video_a if not os.path.exists(video_a) else video_b}")
+        return
+    cap_a = cv2.VideoCapture(video_a)
+    cap_b = cv2.VideoCapture(video_b)
+    fps = cap_a.get(cv2.CAP_PROP_FPS) or 15
+    width_a = int(cap_a.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height_a = int(cap_a.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    width_b = int(cap_b.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height_b = int(cap_b.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    # Resize second to match first height
+    target_h = min(height_a, height_b)
+    scale_a = target_h / height_a
+    scale_b = target_h / height_b
+    new_w_a = int(width_a * scale_a)
+    new_w_b = int(width_b * scale_b)
+    out_w = new_w_a + new_w_b
+    out_h = target_h
+
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    writer = cv2.VideoWriter(output_path, fourcc, fps, (out_w, out_h))
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    while True:
+        ret_a, frame_a = cap_a.read()
+        ret_b, frame_b = cap_b.read()
+        if not (ret_a and ret_b):
+            break
+        frame_a = cv2.resize(frame_a, (new_w_a, target_h))
+        frame_b = cv2.resize(frame_b, (new_w_b, target_h))
+        combined = np.hstack([frame_a, frame_b])
+
+        cv2.putText(combined, label_a, (15, 30), font, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(combined, label_b, (new_w_a + 15, 30), font, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+
+        writer.write(combined)
+
+    cap_a.release()
+    cap_b.release()
+    writer.release()
+    print(f"✅ Side-by-side video: {output_path}")
+
+
+def main():
+    print("\n" + "="*70)
+    print("🚀 ULTRA-FAST PLAYBACK WITH YOLO ANALYSIS (Dual-Model)")
+    print("="*70 + "\n")
+    
+    # === MODE SELECTION ===
+    print("Select mode:")
+    print("1. HEADLESS (no visualization - MAXIMUM SPEED)")
+    print("2. FAST DISPLAY (update every 10 frames)")
+    print("3. NORMAL (update every frame)")
+    mode_choice = input("Enter choice [1/2/3, default=2]: ").strip() or "2"
+    
+    HEADLESS = (mode_choice == "1")
+    DISPLAY_UPDATE_INTERVAL = 1 if mode_choice == "3" else (999999 if HEADLESS else 10)
+    
+    print(f"\n{'🔥 HEADLESS MODE' if HEADLESS else f'📺 DISPLAY MODE (update every {DISPLAY_UPDATE_INTERVAL} frames)'}\n")
+    
+    log_base = "/home/rh960/carla_env/dt_logs"
+    run_names = [
+        "20260403_112049_collision_avoidance",
+        "20260211_161428_rainy_collision_avoidance",
+        "20260211_130643_collision_avoidance"
+    ]
+    
+    # Define models to compare
+    models = [
+        ("yolov5n.pt", "yolov5"),
+        ("yolov8n.pt", "yolov8")
+    ]
+
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    for run_name in run_names:
+        run_dir = os.path.join(log_base, run_name)
+        if not os.path.exists(run_dir):
+            print(f"❌ Directory not found: {run_dir}")
+            continue
+        
+        base_output_dir = os.path.join(run_dir, f"yolo_results_{timestamp}")
+        os.makedirs(base_output_dir, exist_ok=True)
+        
+        print(f"\n📁 Input:  {run_dir}")
+        print(f"📁 Output base: {base_output_dir}\n")
+
+        perf_results = []
+        for weight, tag in models:
+            perf_df = process_model(weight, tag, HEADLESS, DISPLAY_UPDATE_INTERVAL, run_dir, base_output_dir)
+            perf_results.append((tag, perf_df))
+
+        if len(perf_results) == 2:
+            create_comparison_charts(perf_results[0][1], perf_results[1][1],
+                                     [perf_results[0][0], perf_results[1][0]],
+                                     base_output_dir)
+            # Build side-by-side videos (camera and visualisation)
+            cam_a = os.path.join(base_output_dir, models[0][1], f"{models[0][1]}_camera_yolo_video.mp4")
+            cam_b = os.path.join(base_output_dir, models[1][1], f"{models[1][1]}_camera_yolo_video.mp4")
+            vis_a = os.path.join(base_output_dir, models[0][1], f"{models[0][1]}_visualisation_video.mp4")
+            vis_b = os.path.join(base_output_dir, models[1][1], f"{models[1][1]}_visualisation_video.mp4")
+            create_side_by_side_video(cam_a, cam_b, models[0][1], models[1][1],
+                                      os.path.join(base_output_dir, "comparison_camera_side_by_side.mp4"))
+            create_side_by_side_video(vis_a, vis_b, models[0][1], models[1][1],
+                                      os.path.join(base_output_dir, "comparison_visualisation_side_by_side.mp4"))
+
+    print("\n✅ Dual-model runs complete for all specified folders. Check each base output for per-model folders and comparison chart.\n")
 
 if __name__ == "__main__":
     main()

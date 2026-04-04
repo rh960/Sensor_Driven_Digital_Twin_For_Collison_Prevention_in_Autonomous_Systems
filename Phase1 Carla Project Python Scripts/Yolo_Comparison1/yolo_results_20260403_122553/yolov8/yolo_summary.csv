@@ -1,0 +1,15 @@
+Metric,Value
+Total Frames,1185
+Mean Inference Time (ms),19.15
+Median Inference Time (ms),18.96
+Std Dev Inference Time (ms),1.19
+Min Inference Time (ms),18.01
+Max Inference Time (ms),53.59
+Mean FPS,52.3
+Min FPS,18.7
+Max FPS,55.5
+Total Detections,104
+Mean Detections per Frame,0.09
+Frames with Detections,96
+Detection Rate (%),8.1
+Unique Classes Detected,8
